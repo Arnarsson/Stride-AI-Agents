@@ -9,22 +9,34 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 import json
 import re
-from swarm import Agent
+# Ensure the swarm module is installed and available
+# from swarm import Agent
+import time
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+log_file = 'property_scraper.log'
+logging.basicConfig(level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[
+                        logging.FileHandler(log_file),
+                        logging.StreamHandler()
+                    ])
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
+logger.info("Environment variables loaded")
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+logger.info("OpenAI client initialized")
 
 # Function to create a folder for the website
 def create_website_folder(url):
     domain = urlparse(url).netloc
     folder_name = domain.split('.')[0]
     os.makedirs(folder_name, exist_ok=True)
+    logger.info(f"Created folder: {folder_name}")
     return folder_name
 
 # Function to scrape a website using Crawl4AI
@@ -32,57 +44,90 @@ async def scrape_website(url):
     """
     Scrape a website using Crawl4AI's AsyncWebCrawler and clean the content.
     """
-    logging.info(f"Scraping website: {url}")
+    logger.info(f"Starting to scrape website: {url}")
     folder_name = create_website_folder(url)
-    async with AsyncWebCrawler(verbose=True) as crawler:
-        result = await crawler.arun(
-            url=url,
-            extraction_strategy=CosineStrategy(
-                semantic_filter="marketing",
-                word_count_threshold=10,
-                max_dist=0.2,
-                top_k=3
-            ),
-            bypass_cache=True
-        )
+    start_time = time.time()
+    try:
+        async with AsyncWebCrawler(verbose=True) as crawler:
+            logger.info("Initializing AsyncWebCrawler")
+            result = await asyncio.wait_for(
+                crawler.arun(
+                    url=url,
+                    extraction_strategy=CosineStrategy(
+                        semantic_filter="property listings",
+                        word_count_threshold=10,
+                        max_dist=0.2,
+                        top_k=3
+                    ),
+                    bypass_cache=True,
+                ),
+                timeout=300  # 5 minutes timeout
+            )
+        logger.info("Website scraping completed")
+    except asyncio.TimeoutError:
+        logger.error("Scraping timed out after 5 minutes")
+        return None, None
+    except Exception as e:
+        logger.error(f"An error occurred during scraping: {str(e)}")
+        return None, None
+
+    logger.info(f"Scraping took {time.time() - start_time:.2f} seconds")
     
     # Clean and structure the content
+    logger.info("Starting content cleaning and property extraction process")
     soup = BeautifulSoup(result.html, 'html.parser')
     
-    # Remove script and style elements
-    for script in soup(["script", "style"]):
-        script.decompose()
+    # Extracting property details
+    data = []
+    for item in soup.find_all('div', class_='search-list-item'):  # Updated class to match Boliga's structure
+        property_type = item.find('div', class_='property-type').get_text(strip=True) if item.find('div', class_='property-type') else 'N/A'
+        rooms = item.find('div', class_='rooms').get_text(strip=True) if item.find('div', class_='rooms') else 'N/A'
+        size = item.find('div', class_='size').get_text(strip=True) if item.find('div', class_='size') else 'N/A'
+        price = item.find('div', class_='price').get_text(strip=True) if item.find('div', class_='price') else 'N/A'
+        address = item.find('div', class_='address').get_text(strip=True) if item.find('div', class_='address') else 'N/A'
+        energy_mark = item.find('div', class_='energy-mark').get_text(strip=True) if item.find('div', class_='energy-mark') else 'N/A'
+        listing_date = item.find('div', class_='listing-date').get_text(strip=True) if item.find('div', class_='listing-date') else 'N/A'
+        data.append([property_type, rooms, size, price, address, energy_mark, listing_date])
     
-    # Get text
-    text = soup.get_text()
+    logger.info(f"Extracted {len(data)} property listings")
     
-    # Break into lines and remove leading and trailing space on each
-    lines = (line.strip() for line in text.splitlines())
+    # Save the extracted property data to a file
+    property_data_file = os.path.join(folder_name, "property_data.json")
+    with open(property_data_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
     
-    # Break multi-headlines into a line each
-    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+    logger.info(f"Property data saved to {property_data_file}")
     
-    # Drop blank lines
-    text = '\n'.join(chunk for chunk in chunks if chunk)
-    
-    # Remove excessive newlines
-    text = re.sub(r'\n+', '\n\n', text)
-    
-    # Save the cleaned content to a file
-    content_file = os.path.join(folder_name, "full_website_content.md")
-    with open(content_file, "w", encoding="utf-8") as f:
-        f.write(text)
-    
-    logging.info(f"Cleaned website content saved to {content_file}")
-    
-    # Save the extracted content to a file
-    extracted_content_file = os.path.join(folder_name, "website-content.md")
-    with open(extracted_content_file, "w", encoding="utf-8") as f:
-        f.write(result.extracted_content)
-    
-    logging.info(f"Extracted content saved to {extracted_content_file}")
-    
-    return text, result.extracted_content
+    return data, result.extracted_content
+
+# Define Swarm agents
+class WebScraperAgent:
+    async def run(self, url):
+        logger.info(f"WebScraperAgent started for URL: {url}")
+        result = await scrape_website(url)
+        logger.info("WebScraperAgent completed")
+        return result
+
+class AnalystAgent:
+    async def run(self, content):
+        logger.info("AnalystAgent started")
+        result = analyze_property_data(content)
+        logger.info("AnalystAgent completed")
+        return result
+
+# Function to analyze property data
+def analyze_property_data(data):
+    """
+    Analyze the scraped property data using OpenAI.
+    """
+    logger.info("Starting property data analysis")
+    analysis = generate_completion(
+        "real estate analyst",
+        "Analyze the following property data and provide key insights for potential buyers or investors.",
+        json.dumps(data)
+    )
+    logger.info("Property data analysis completed")
+    return {"analysis": analysis}
 
 # Function to generate completions using OpenAI
 def generate_completion(role, task, content):
@@ -90,7 +135,7 @@ def generate_completion(role, task, content):
     Generate a completion using OpenAI's GPT model.
     This function demonstrates how to interact with OpenAI's API.
     """
-    logging.info(f"Generating completion for {role}")
+    logger.info(f"Generating completion for role: {role}")
     response = client.chat.completions.create(
         model="gpt-4o",  # Using GPT-4o for high-quality responses
         messages=[
@@ -98,123 +143,61 @@ def generate_completion(role, task, content):
             {"role": "user", "content": content}
         ]
     )
+    logger.info("Completion generated successfully")
     return response.choices[0].message.content
 
-# Function to analyze website content
-def analyze_website_content(content):
-    """
-    Analyze the scraped website content using OpenAI.
-    This function demonstrates how to use AI for content analysis.
-    """
-    logging.info("Analyzing website content")
-    analysis = generate_completion(
-        "marketing analyst",
-        "Analyze the following website content and provide key insights for marketing strategy.",
-        content
-    )
-    return {"analysis": analysis}
-
-# Function to create a campaign idea
-def create_campaign_idea(target_audience, goals):
-    """
-    Create a campaign idea based on target audience and goals using OpenAI.
-    This function demonstrates AI's capability in strategic planning.
-    """
-    logging.info("Creating campaign idea")
-    campaign_idea = generate_completion(
-        "marketing strategist",
-        "Create an innovative campaign idea based on the target audience and goals provided.",
-        f"Target Audience: {target_audience}\nGoals: {goals}"
-    )
-    return {"campaign_idea": campaign_idea}
-
-# Function to generate marketing copy
-def generate_copy(brief):
-    """
-    Generate marketing copy based on a brief using OpenAI.
-    This function shows how AI can be used for content creation.
-    """
-    logging.info("Generating marketing copy")
-    copy = generate_completion(
-        "copywriter",
-        "Create compelling marketing copy based on the following brief.",
-        brief
-    )
-    return {"copy": copy}
-
-# Define Swarm agents
-class WebScraperAgent(Agent):
-    async def run(self, url):
-        return await scrape_website(url)
-
-class AnalystAgent(Agent):
-    async def run(self, content):
-        return analyze_website_content(content)
-
-class CampaignIdeaAgent(Agent):
-    async def run(self, target_audience, goals):
-        return create_campaign_idea(target_audience, goals)
-
-class CopywriterAgent(Agent):
-    async def run(self, brief):
-        return generate_copy(brief)
-
-class UserInterfaceAgent(Agent):
+class UserInterfaceAgent:
     async def run(self):
-        url = input("Please enter a URL to analyze: ")
+        logger.info("UserInterfaceAgent started")
+        url = input("Please enter a URL to analyze (e.g., a Boliga property listing page): ")
+        logger.info(f"User entered URL: {url}")
         
         scraper_agent = WebScraperAgent()
-        scraped_content, structured_content = await scraper_agent.run(url)
+        property_data, extracted_content = await scraper_agent.run(url)
         
+        if property_data is None or extracted_content is None:
+            logger.error("Scraping failed. Please check the logs for more information.")
+            return
+
         folder_name = create_website_folder(url)
         
         analyst_agent = AnalystAgent()
-        analysis = await analyst_agent.run(json.dumps(structured_content))
+        analysis = await analyst_agent.run(property_data)
         
         # Save analysis
-        with open(os.path.join(folder_name, "analysis.md"), "w", encoding="utf-8") as f:
+        analysis_file = os.path.join(folder_name, "property_analysis.md")
+        with open(analysis_file, "w", encoding="utf-8") as f:
             f.write(analysis['analysis'])
+        logger.info(f"Property analysis saved to {analysis_file}")
         
-        target_audience = input("Please describe the target audience: ")
-        goals = input("Please describe the marketing goals: ")
-        
-        campaign_agent = CampaignIdeaAgent()
-        campaign_idea = await campaign_agent.run(target_audience, goals)
-        
-        # Save campaign idea
-        with open(os.path.join(folder_name, "campaign_idea.md"), "w", encoding="utf-8") as f:
-            f.write(campaign_idea['campaign_idea'])
-        
-        copywriter_agent = CopywriterAgent()
-        marketing_copy = await copywriter_agent.run(campaign_idea['campaign_idea'])
-        
-        # Save marketing copy
-        with open(os.path.join(folder_name, "marketing_copy.md"), "w", encoding="utf-8") as f:
-            f.write(marketing_copy['copy'])
-        
-        # Create and save comprehensive marketing plan
-        marketing_plan = f"""# Comprehensive Marketing Plan
+        # Create and save comprehensive property report
+        property_report = f"""# Comprehensive Property Report
 
-## Website Analysis
+## Extracted Property Data
+{json.dumps(property_data, indent=2)}
+
+## Property Analysis
 {analysis['analysis']}
-
-## Campaign Idea
-{campaign_idea['campaign_idea']}
-
-## Marketing Copy
-{marketing_copy['copy']}
 """
-        with open(os.path.join(folder_name, "marketing-plan.md"), "w", encoding="utf-8") as f:
-            f.write(marketing_plan)
+        report_file = os.path.join(folder_name, "property-report.md")
+        with open(report_file, "w", encoding="utf-8") as f:
+            f.write(property_report)
+        logger.info(f"Comprehensive property report saved to {report_file}")
         
         print(f"All output files have been saved in the '{folder_name}' folder.")
-        print("Demo completed. Thank you for using our marketing assistant!")
+        print("Analysis completed. Thank you for using our property analysis assistant!")
         print("Thank you for using the Stride Swarm AI Agent - to have our team implement AI agents into your business, book a call at https://executivestride.com/apply")
+        logger.info("UserInterfaceAgent completed")
 
 # Main execution
 async def main():
+    logger.info("Main execution started")
     ui_agent = UserInterfaceAgent()
     await ui_agent.run()
+    logger.info("Main execution completed")
+    print(f"Logs have been saved to {os.path.abspath(log_file)}")
 
 if __name__ == "__main__":
+    logger.info("Script started")
     asyncio.run(main())
+    logger.info("Script completed")
